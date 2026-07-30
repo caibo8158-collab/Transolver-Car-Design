@@ -9,6 +9,8 @@ ACTIVATION = {'gelu': nn.GELU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid, 'relu': n
 
 
 class Physics_Attention_Irregular_Mesh(nn.Module):
+    """不规则网格上的 Physics-Attention：先把 N 个点软划分到 G 个 slice，再在 slice 间做注意力。"""
+
     def __init__(self, dim, heads=8, dim_head=64, dropout=0., slice_num=64):
         super().__init__()
         inner_dim = dim_head * heads
@@ -17,13 +19,16 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head ** -0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
+        # 控制 slice 分配的软硬程度；可学习
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
 
-        self.in_project_x = nn.Linear(dim, inner_dim)
-        self.in_project_fx = nn.Linear(dim, inner_dim)
+        self.in_project_x = nn.Linear(dim, inner_dim)       # 用于计算 slice 归属
+        self.in_project_fx = nn.Linear(dim, inner_dim)      # 用于聚合成 slice token 的特征
+        # 每个点 → G 个 slice 的打分；G = slice_num
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         for l in [self.in_project_slice]:
-            torch.nn.init.orthogonal_(l.weight)  # use a principled initialization
+            torch.nn.init.orthogonal_(l.weight)  # 正交初始化，让初始 slice 更分散
+        # 在 G 个 slice token 上做标准 QKV 注意力
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
@@ -33,31 +38,35 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
 
     def forward(self, x):
-        # B N C
+        # x: [B, N, C]，N 为网格点数，C 为通道维
         B, N, C = x.shape
 
-        ### (1) Slice
+        ### (1) Slice：把 N 个点软划分到 G 个物理切片，并聚合成 slice token
+        # 投影并拆成多头 → [B, H, N, dim_head]
         fx_mid = self.in_project_fx(x).reshape(B, N, self.heads, self.dim_head) \
-            .permute(0, 2, 1, 3).contiguous()  # B H N C
+            .permute(0, 2, 1, 3).contiguous()  # 待聚合的点特征
         x_mid = self.in_project_x(x).reshape(B, N, self.heads, self.dim_head) \
-            .permute(0, 2, 1, 3).contiguous()  # B H N C
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)  # B H N G
-        slice_norm = slice_weights.sum(2)  # B H G
+            .permute(0, 2, 1, 3).contiguous()  # 用于算归属权重
+        # 每个点对 G 个 slice 的软权重；G = slice_num，形状 [B, H, N, G]
+        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+        # 每个 slice 上所有点的权重和，用于归一化
+        slice_norm = slice_weights.sum(2)  # [B, H, G]
+        # 加权求和：N 个点 → G 个 slice token，形状 [B, H, G, dim_head]
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        ### (2) Attention among slice tokens
+        ### (2) Attention：在 G 个 slice token 之间做注意力（复杂度 O(G²)，与 N 无关）
         q_slice_token = self.to_q(slice_token)
         k_slice_token = self.to_k(slice_token)
         v_slice_token = self.to_v(slice_token)
         dots = torch.matmul(q_slice_token, k_slice_token.transpose(-1, -2)) * self.scale
         attn = self.softmax(dots)
         attn = self.dropout(attn)
-        out_slice_token = torch.matmul(attn, v_slice_token)  # B H G D
+        out_slice_token = torch.matmul(attn, v_slice_token)  # [B, H, G, dim_head]
 
-        ### (3) Deslice
+        ### (3) Deslice：用同一套 slice_weights 把 slice token 反投影回每个网格点
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
-        out_x = rearrange(out_x, 'b h n d -> b n (h d)')
+        out_x = rearrange(out_x, 'b h n d -> b n (h d)')  # 合并多头 → [B, N, H*dim_head]
         return self.to_out(out_x)
 
 
@@ -74,8 +83,11 @@ class MLP(nn.Module):
         self.n_output = n_output
         self.n_layers = n_layers
         self.res = res
+        # 前置层：n_input → n_hidden，再激活（如 GELU）
         self.linear_pre = nn.Sequential(nn.Linear(n_input, n_hidden), act())
+        # 输出层：n_hidden → n_output
         self.linear_post = nn.Linear(n_hidden, n_output)
+        # 中间层：共 n_layers 个，均为 n_hidden → n_hidden + 激活
         self.linears = nn.ModuleList([nn.Sequential(nn.Linear(n_hidden, n_hidden), act()) for _ in range(n_layers)])
 
     def forward(self, x):
@@ -193,21 +205,30 @@ class Model(nn.Module):
         return pos
 
     def forward(self, data):
+        # data: (cfd_data, geom_data)；本任务主要用 cfd_data
+        # cfd_data.x: [N, space_dim]，每点输入特征（默认 7 维）
         cfd_data, geom_data = data
-        x, fx, T = cfd_data.x, None, None
-        x = x[None, :, :]
+        x, fx, T = cfd_data.x, None, None  # fx/T 预留；当前未用，恒为 None
+        x = x[None, :, :]  # 补 batch 维 → [1, N, C]
+
+        # 可选：拼接到参考网格的距离编码 → [1, N, C+ref³]
         if self.unified_pos:
             new_pos = self.get_grid(cfd_data.pos[None, :, :])
             x = torch.cat((x, new_pos), dim=-1)
 
+        # 预处理 MLP：点特征 → 隐空间 [1, N, n_hidden]
         if fx is not None:
             fx = torch.cat((x, fx), -1)
             fx = self.preprocess(fx)
         else:
+            # 当前默认路径：只用 x，再加可学习占位偏置
             fx = self.preprocess(x)
             fx = fx + self.placeholder[None, None, :]
 
+        # 逐层 Transolver_block：Physics-Attention + MLP
+        # 前 n_layers-1 层输出 [1, N, n_hidden]；最后一层映到 [1, N, out_dim]
         for block in self.blocks:
             fx = block(fx)
 
+        # 去掉 batch 维，返回 [N, out_dim]（默认 4：速度 xyz + 压力）
         return fx[0]

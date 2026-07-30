@@ -2,9 +2,33 @@ import numpy as np
 import time, json, os
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+
+
+def plot_loss_curves(history, save_path):
+    """根据训练记录绘制 train_loss / val_loss 曲线。"""
+    epochs = history['epoch']
+    train_losses = history['train_loss']
+    val_epochs = history['val_epoch']
+    val_losses = history['val_loss']
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, train_losses, label='train_loss', color='#1f77b4', linewidth=1.5)
+    if val_epochs:
+        plt.plot(val_epochs, val_losses, label='val_loss', color='#d62728',
+                 marker='o', markersize=3, linewidth=1.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training / Validation Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f'Loss curve saved to: {save_path}')
 
 
 def get_nb_trainable_params(model):
@@ -86,12 +110,21 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, reg=1, val_iter
     start = time.time()
 
     train_loss, val_loss = 1e5, 1e5
+    history = {
+        'epoch': [],
+        'train_loss': [],
+        'val_epoch': [],
+        'val_loss': [],
+    }
     pbar_train = tqdm(range(hparams['nb_epochs']), position=0)
     for epoch in pbar_train:
         train_loader = DataLoader(train_dataset, batch_size=hparams['batch_size'], shuffle=True, drop_last=True)
         loss_velo, loss_press = train(device, model, train_loader, optimizer, lr_scheduler, reg=reg)
         train_loss = loss_velo + reg * loss_press
         del (train_loader)
+
+        history['epoch'].append(epoch + 1)
+        history['train_loss'].append(float(train_loss))
 
         if val_iter is not None and (epoch == hparams['nb_epochs'] - 1 or epoch % val_iter == 0):
             val_loader = DataLoader(val_dataset, batch_size=1)
@@ -100,6 +133,8 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, reg=1, val_iter
             val_loss = loss_velo + reg * loss_press
             del (val_loader)
 
+            history['val_epoch'].append(epoch + 1)
+            history['val_loss'].append(float(val_loss))
             pbar_train.set_postfix(train_loss=train_loss, val_loss=val_loss)
         else:
             pbar_train.set_postfix(train_loss=train_loss)
@@ -110,6 +145,14 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, reg=1, val_iter
     print('Number of parameters:', params_model)
     print('Time elapsed: {0:.2f} seconds'.format(time_elapsed))
     torch.save(model, path + os.sep + f'model_{hparams["nb_epochs"]}.pth')
+
+    history_path = path + os.sep + f'loss_history_{hparams["nb_epochs"]}.json'
+    with open(history_path, 'w') as f:
+        json.dump(history, f, indent=2)
+    print(f'Loss history saved to: {history_path}')
+
+    curve_path = path + os.sep + f'loss_curve_{hparams["nb_epochs"]}.png'
+    plot_loss_curves(history, curve_path)
 
     if val_iter is not None:
         with open(path + os.sep + f'log_{hparams["nb_epochs"]}.json', 'a') as f:

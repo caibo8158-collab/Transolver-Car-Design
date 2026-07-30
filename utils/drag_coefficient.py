@@ -145,11 +145,11 @@ def get_normal(unstructured_grid_data):
 
 
 ############## calculate coefficient ##############
-def cal_coefficient(file_name, press_surf=None, velo_surf=None):
-    root = '/Users/caibo/Desktop/Transolver-main/mlcfd_data/training_data'
-    save_path = '/Users/caibo/Desktop/Transolver-main/mlcfd_data/preprocessed_data/param0/' + file_name
-    file_name_press = 'param0/' + file_name + '/quadpress_smpl.vtk'
-    file_name_velo = 'param0/' + file_name + '/hexvelo_smpl.vtk'
+def cal_coefficient(file_name, press_surf=None, velo_surf=None, root=None, fold='param0'):
+    if root is None:
+        root = r'C:\Users\cc\Downloads\mlcfd_data\mlcfd_data\training_data'
+    file_name_press = os.path.join(fold, file_name, 'quadpress_smpl.vtk')
+    file_name_velo = os.path.join(fold, file_name, 'hexvelo_smpl.vtk')
     file_name_press = os.path.join(root, file_name_press)
     file_name_velo = os.path.join(root, file_name_velo)
     unstructured_grid_data_press = load_unstructured_grid_data(file_name_press)

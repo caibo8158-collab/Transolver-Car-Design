@@ -191,13 +191,13 @@ def get_datalist(root, samples, norm=False, coef_norm=None, savedir=None, prepro
                 continue
 
             unstructured_grid_data_press = load_unstructured_grid_data(file_name_press)
-            unstructured_grid_data_velo = load_unstructured_grid_data(file_name_velo)
+            unstructured_grid_data_velo = load_unstructured_grid_data(file_name_velo)#读取两类数据
 
             # 物理量与坐标
-            velo = vtk_to_numpy(unstructured_grid_data_velo.GetPointData().GetVectors())
-            press = vtk_to_numpy(unstructured_grid_data_press.GetPointData().GetScalars())
-            points_velo = vtk_to_numpy(unstructured_grid_data_velo.GetPoints().GetData())
-            points_press = vtk_to_numpy(unstructured_grid_data_press.GetPoints().GetData())
+            velo = vtk_to_numpy(unstructured_grid_data_velo.GetPointData().GetVectors())#抽出体积网络速度数据
+            press = vtk_to_numpy(unstructured_grid_data_press.GetPointData().GetScalars())#抽出表面压力数据
+            points_velo = vtk_to_numpy(unstructured_grid_data_velo.GetPoints().GetData())#抽出体积网络坐标数据
+            points_press = vtk_to_numpy(unstructured_grid_data_press.GetPoints().GetData())#抽出表面坐标数据
 
             # 网格边：表面四边形 cell_size=4，体积六面体 cell_size=8
             edges_press = get_edges(unstructured_grid_data_press, points_press, cell_size=4)
@@ -209,20 +209,22 @@ def get_datalist(root, samples, norm=False, coef_norm=None, savedir=None, prepro
             normal_press = get_normal(unstructured_grid_data_press)
 
             # 分离：外部流场点 vs 车身表面点
-            surface = {tuple(p) for p in points_press}
-            exterior_indices = [i for i, p in enumerate(points_velo) if tuple(p) not in surface]
-            velo_dict = {tuple(p): velo[i] for i, p in enumerate(points_velo)}
+            surface = {tuple(p) for p in points_press}  # 表面点坐标集合，用于判断重合
+            exterior_indices = [i for i, p in enumerate(points_velo) if tuple(p) not in surface]  # 纯外部点下标
+            velo_dict = {tuple(p): velo[i] for i, p in enumerate(points_velo)}  # 坐标 → 速度，供表面点对齐
 
-            pos_ext = points_velo[exterior_indices]
-            pos_surf = points_press
-            sdf_ext = sdf_velo[exterior_indices]
-            sdf_surf = sdf_press
-            normal_ext = normal_velo[exterior_indices]
-            normal_surf = normal_press
-            velo_ext = velo[exterior_indices]
+            # _ext：外部流场点；_surf：车身表面点
+            pos_ext = points_velo[exterior_indices]   # 外部点坐标 (x,y,z)
+            pos_surf = points_press                    # 表面点坐标
+            sdf_ext = sdf_velo[exterior_indices]      # 外部点到车身距离
+            sdf_surf = sdf_press                      # 表面点距离，全 0
+            normal_ext = normal_velo[exterior_indices]  # 外部点：离最近表面点的方向
+            normal_surf = normal_press                  # 表面点：几何法向
+            velo_ext = velo[exterior_indices]           # 外部点速度 (vx,vy,vz)
+            # 表面点速度：体积网格有同坐标则取，否则填 0
             velo_surf = np.array([velo_dict[tuple(p)] if tuple(p) in velo_dict else np.zeros(3) for p in pos_surf])
             press_ext = np.zeros([len(exterior_indices), 1])  # 体积点不监督压力，填 0
-            press_surf = press
+            press_surf = press                          # 表面压力真值（要监督）
 
             # 输入 / 标签拼接
             init_ext = np.c_[pos_ext, sdf_ext, normal_ext]
@@ -230,11 +232,12 @@ def get_datalist(root, samples, norm=False, coef_norm=None, savedir=None, prepro
             target_ext = np.c_[velo_ext, press_ext]
             target_surf = np.c_[velo_surf, press_surf]
 
-            # 顺序：先外部点，再表面点；surf=0/1 标记
-            surf = np.concatenate([np.zeros(len(pos_ext)), np.ones(len(pos_surf))])
-            pos = np.concatenate([pos_ext, pos_surf])
-            init = np.concatenate([init_ext, init_surf])
-            target = np.concatenate([target_ext, target_surf])
+            # 行方向拼接：先外部点，再表面点，合成一个完整样本
+            surf = np.concatenate([np.zeros(len(pos_ext)), np.ones(len(pos_surf))])  # 0=外部，1=表面
+            pos = np.concatenate([pos_ext, pos_surf])          # 全部点坐标
+            init = np.concatenate([init_ext, init_surf])      # 全部点输入 x，7 维
+            target = np.concatenate([target_ext, target_surf])  # 全部点标签 y，4 维
+            # 用合并后的 pos 把表面边+体积边映射为统一节点编号
             edge_index = get_edge_index(pos, edges_press, edges_velo)
 
             # 缓存到 savedir，供下次 --preprocessed 1 直接读取

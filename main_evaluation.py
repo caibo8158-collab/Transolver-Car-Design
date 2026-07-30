@@ -12,15 +12,15 @@ from dataset.dataset import GraphDataset
 import scipy as sc
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_dir', default='/Users/caibo/Desktop/Transolver-main/mlcfd_data/training_data')
-parser.add_argument('--save_dir', default='/Users/caibo/Desktop/Transolver-main/mlcfd_data/preprocessed_data')
+parser.add_argument('--data_dir', default=r'C:\Users\cc\Downloads\mlcfd_data\mlcfd_data\training_data')
+parser.add_argument('--save_dir', default=r'C:\Users\cc\Downloads\mlcfd_data\preprocessed_data')
 parser.add_argument('--fold_id', default=0, type=int)
 parser.add_argument('--gpu', default=0, type=int)
-parser.add_argument('--cfd_model')
+parser.add_argument('--cfd_model', default='Transolver')
 parser.add_argument('--cfd_mesh', action='store_true')
 parser.add_argument('--r', default=0.2, type=float)
 parser.add_argument('--weight', default=0.5, type=float)
-parser.add_argument('--nb_epochs', default=200, type=float)
+parser.add_argument('--nb_epochs', default=200, type=int)
 args = parser.parse_args()
 print(args)
 
@@ -33,7 +33,7 @@ train_data, val_data, coef_norm, vallst = load_train_val_fold_file(args, preproc
 val_ds = GraphDataset(val_data, use_cfd_mesh=args.cfd_mesh, r=args.r)
 
 path = f'metrics/{args.cfd_model}/{args.fold_id}/{args.nb_epochs}_{args.weight}'
-model = torch.load(os.path.join(path, f'model_{args.nb_epochs}.pth')).to(device)
+model = torch.load(os.path.join(path, f'model_{args.nb_epochs}.pth'), weights_only=False).to(device)
 
 test_loader = DataLoader(val_ds, batch_size=1)
 
@@ -76,10 +76,16 @@ with torch.no_grad():
         np.save('./results/' + args.cfd_model + '/' + str(index) + '_pred.npy', out_denorm.detach().cpu().numpy())
         np.save('./results/' + args.cfd_model + '/' + str(index) + '_gt.npy', y_denorm.detach().cpu().numpy())
 
-        pred_coef = cal_coefficient(vallst[index].split('/')[1], pred_press[:, None].detach().cpu().numpy(),
-                                    pred_surf_velo.detach().cpu().numpy())
-        gt_coef = cal_coefficient(vallst[index].split('/')[1], gt_press[:, None].detach().cpu().numpy(),
-                                  gt_surf_velo.detach().cpu().numpy())
+        sample_id = os.path.basename(vallst[index].replace('\\', '/'))
+        fold_name = os.path.dirname(vallst[index].replace('\\', '/')).replace('\\', '/')
+        if not fold_name:
+            fold_name = f'param{args.fold_id}'
+        pred_coef = cal_coefficient(sample_id, pred_press[:, None].detach().cpu().numpy(),
+                                    pred_surf_velo.detach().cpu().numpy(),
+                                    root=args.data_dir, fold=fold_name)
+        gt_coef = cal_coefficient(sample_id, gt_press[:, None].detach().cpu().numpy(),
+                                  gt_surf_velo.detach().cpu().numpy(),
+                                  root=args.data_dir, fold=fold_name)
 
         gt_coef_list.append(gt_coef)
         pred_coef_list.append(pred_coef)
