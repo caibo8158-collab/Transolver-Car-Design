@@ -33,6 +33,8 @@ parser.add_argument('--batch_size', default=1, type=int)
 parser.add_argument('--nb_epochs', default=200, type=int)
 # 1：假定 save_dir 已有预处理 npy；0：从 VTK 现场预处理并保存（首次运行请用 0）
 parser.add_argument('--preprocessed', default=1, type=int)
+# global: 全体点统一 mean/std；separate: 表面/体积点分开归一化
+parser.add_argument('--norm_mode', default='global', choices=['global', 'separate'])
 args = parser.parse_args()
 print(args)
 
@@ -68,7 +70,7 @@ else:
     raise ValueError(f'未知模型: {args.cfd_model!r}，目前仅支持 Transolver')
 
 # 日志与权重保存路径
-path = f'metrics/{args.cfd_model}/{args.fold_id}/{args.nb_epochs}_{args.weight}'
+path = f'metrics/{args.cfd_model}/{args.fold_id}/{args.nb_epochs}_{args.weight}_{args.norm_mode}'
 if not os.path.exists(path):
     os.makedirs(path)
 

@@ -45,15 +45,18 @@ def load_train_val_fold(args, preprocessed):
         trainlst += samples[i]
     vallst = samples[args.fold_id] if 0 <= args.fold_id < len(samples) else None
 
+    norm_mode = getattr(args, 'norm_mode', 'global')
     if preprocessed:
         print("use preprocessed data")
-    print("loading data")
+    print("loading data, norm_mode=", norm_mode)
     # 训练集：同时返回 dataset 与归一化系数
-    train_dataset, coef_norm = get_datalist(args.data_dir, trainlst, norm=True, savedir=args.save_dir,
-                                            preprocessed=preprocessed)
+    train_dataset, coef_norm = get_datalist(
+        args.data_dir, trainlst, norm=True, savedir=args.save_dir,
+        preprocessed=preprocessed, norm_mode=norm_mode)
     # 验证集：传入 coef_norm，不再重新统计均值方差
-    val_dataset = get_datalist(args.data_dir, vallst, coef_norm=coef_norm, savedir=args.save_dir,
-                               preprocessed=preprocessed)
+    val_dataset = get_datalist(
+        args.data_dir, vallst, coef_norm=coef_norm, savedir=args.save_dir,
+        preprocessed=preprocessed, norm_mode=norm_mode)
     print("load data finish")
     return train_dataset, val_dataset, coef_norm
 
@@ -73,12 +76,15 @@ def load_train_val_fold_file(args, preprocessed):
         trainlst += samples[i]
     vallst = samples[args.fold_id] if 0 <= args.fold_id < len(samples) else None
 
+    norm_mode = getattr(args, 'norm_mode', 'global')
     if preprocessed:
         print("use preprocessed data")
-    print("loading data")
-    train_dataset, coef_norm = get_datalist(args.data_dir, trainlst, norm=True, savedir=args.save_dir,
-                                            preprocessed=preprocessed)
-    val_dataset = get_datalist(args.data_dir, vallst, coef_norm=coef_norm, savedir=args.save_dir,
-                               preprocessed=preprocessed)
+    print("loading data, norm_mode=", norm_mode)
+    train_dataset, coef_norm = get_datalist(
+        args.data_dir, trainlst, norm=True, savedir=args.save_dir,
+        preprocessed=preprocessed, norm_mode=norm_mode)
+    val_dataset = get_datalist(
+        args.data_dir, vallst, coef_norm=coef_norm, savedir=args.save_dir,
+        preprocessed=preprocessed, norm_mode=norm_mode)
     print("load data finish")
     return train_dataset, val_dataset, coef_norm, vallst

@@ -8,7 +8,7 @@ from torch import nn
 from torch_geometric.loader import DataLoader
 from utils.drag_coefficient import cal_coefficient
 from dataset.load_dataset import load_train_val_fold_file
-from dataset.dataset import GraphDataset
+from dataset.dataset import GraphDataset, denormalize_y, is_separate_coef
 import scipy as sc
 
 parser = argparse.ArgumentParser()
@@ -21,6 +21,7 @@ parser.add_argument('--cfd_mesh', action='store_true')
 parser.add_argument('--r', default=0.2, type=float)
 parser.add_argument('--weight', default=0.5, type=float)
 parser.add_argument('--nb_epochs', default=200, type=int)
+parser.add_argument('--norm_mode', default='global', choices=['global', 'separate'])
 args = parser.parse_args()
 print(args)
 
@@ -32,7 +33,10 @@ device = torch.device(f'cuda:{args.gpu}' if use_cuda else 'cpu')
 train_data, val_data, coef_norm, vallst = load_train_val_fold_file(args, preprocessed=True)
 val_ds = GraphDataset(val_data, use_cfd_mesh=args.cfd_mesh, r=args.r)
 
-path = f'metrics/{args.cfd_model}/{args.fold_id}/{args.nb_epochs}_{args.weight}'
+path = f'metrics/{args.cfd_model}/{args.fold_id}/{args.nb_epochs}_{args.weight}_{args.norm_mode}'
+if not os.path.exists(path):
+    # 兼容旧路径（无 norm_mode 后缀）
+    path = f'metrics/{args.cfd_model}/{args.fold_id}/{args.nb_epochs}_{args.weight}'
 model = torch.load(os.path.join(path, f'model_{args.nb_epochs}.pth'), weights_only=False).to(device)
 
 test_loader = DataLoader(val_ds, batch_size=1)
@@ -62,16 +66,14 @@ with torch.no_grad():
         targets = cfd_data.y
 
         if coef_norm is not None:
-            mean = torch.tensor(coef_norm[2]).to(device)
-            std = torch.tensor(coef_norm[3]).to(device)
-            pred_press = out[cfd_data.surf, -1] * std[-1] + mean[-1]
-            gt_press = targets[cfd_data.surf, -1] * std[-1] + mean[-1]
-            pred_surf_velo = out[cfd_data.surf, :-1] * std[:-1] + mean[:-1]
-            gt_surf_velo = targets[cfd_data.surf, :-1] * std[:-1] + mean[:-1]
-            pred_velo = out[~cfd_data.surf, :-1] * std[:-1] + mean[:-1]
-            gt_velo = targets[~cfd_data.surf, :-1] * std[:-1] + mean[:-1]
-            out_denorm = out * std + mean
-            y_denorm = targets * std + mean
+            out_denorm = denormalize_y(out, cfd_data.surf, coef_norm)
+            y_denorm = denormalize_y(targets, cfd_data.surf, coef_norm)
+            pred_press = out_denorm[cfd_data.surf, -1]
+            gt_press = y_denorm[cfd_data.surf, -1]
+            pred_surf_velo = out_denorm[cfd_data.surf, :-1]
+            gt_surf_velo = y_denorm[cfd_data.surf, :-1]
+            pred_velo = out_denorm[~cfd_data.surf, :-1]
+            gt_velo = y_denorm[~cfd_data.surf, :-1]
 
         np.save('./results/' + args.cfd_model + '/' + str(index) + '_pred.npy', out_denorm.detach().cpu().numpy())
         np.save('./results/' + args.cfd_model + '/' + str(index) + '_gt.npy', y_denorm.detach().cpu().numpy())
@@ -115,8 +117,13 @@ with torch.no_grad():
     rmse_press = np.sqrt(np.mean(mses_press))
     rmse_velo_var = np.sqrt(np.mean(mses_velo_var, axis=0))
     if coef_norm is not None:
-        rmse_press *= coef_norm[3][-1]
-        rmse_velo_var *= coef_norm[3][:-1]
+        if is_separate_coef(coef_norm):
+            # 标准化空间 RMSE × 对应分区 std，还原近似物理 RMSE
+            rmse_press *= coef_norm['surf'][3][-1]
+            rmse_velo_var *= coef_norm['vol'][3][:-1]
+        else:
+            rmse_press *= coef_norm[3][-1]
+            rmse_velo_var *= coef_norm[3][:-1]
     print('relative l2 error press:', l2err_press)
     print('relative l2 error velo:', l2err_velo)
     print('press:', rmse_press)

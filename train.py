@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+from dataset.dataset import denormalize_y, coef_norm_to_jsonable
 
 
 def plot_loss_curves(history, save_path):
@@ -69,12 +70,18 @@ def train(device, model, train_loader, optimizer, scheduler, reg=1):
 
 
 @torch.no_grad()
-def test(device, model, test_loader):
+def test(device, model, test_loader, coef_norm=None):
+    """
+    返回标准化空间的 (loss_press, loss_velo)。
+    若传入 coef_norm，额外在物理量纲下统计相对 L2（跨归一化方式可公平对比）。
+    """
     model.eval()
 
     criterion_func = nn.MSELoss(reduction='none')
     losses_press = []
     losses_velo = []
+    l2_press_list = []
+    l2_velo_list = []
     for cfd_data, geom in test_loader:
         cfd_data = cfd_data.to(device)
         geom = geom.to(device)
@@ -88,7 +95,19 @@ def test(device, model, test_loader):
         losses_press.append(loss_press.item())
         losses_velo.append(loss_velo.item())
 
-    return np.mean(losses_press), np.mean(losses_velo)
+        if coef_norm is not None:
+            pred = denormalize_y(out, cfd_data.surf, coef_norm)
+            gt = denormalize_y(targets, cfd_data.surf, coef_norm)
+            p_pred, p_gt = pred[cfd_data.surf, -1], gt[cfd_data.surf, -1]
+            v_pred, v_gt = pred[~cfd_data.surf, :-1], gt[~cfd_data.surf, :-1]
+            l2_press_list.append((torch.norm(p_pred - p_gt) / (torch.norm(p_gt) + 1e-8)).item())
+            l2_velo_list.append((torch.norm(v_pred - v_gt) / (torch.norm(v_gt) + 1e-8)).item())
+
+    press_m = float(np.mean(losses_press))
+    velo_m = float(np.mean(losses_velo))
+    if coef_norm is not None:
+        return press_m, velo_m, float(np.mean(l2_press_list)), float(np.mean(l2_velo_list))
+    return press_m, velo_m
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -115,11 +134,13 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, reg=1, val_iter
         'train_loss': [],
         'val_epoch': [],
         'val_loss': [],
+        'val_l2_press': [],
+        'val_l2_velo': [],
     }
     pbar_train = tqdm(range(hparams['nb_epochs']), position=0)
     for epoch in pbar_train:
         train_loader = DataLoader(train_dataset, batch_size=hparams['batch_size'], shuffle=True, drop_last=True)
-        loss_velo, loss_press = train(device, model, train_loader, optimizer, lr_scheduler, reg=reg)
+        loss_press, loss_velo = train(device, model, train_loader, optimizer, lr_scheduler, reg=reg)
         train_loss = loss_velo + reg * loss_press
         del (train_loader)
 
@@ -129,13 +150,24 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, reg=1, val_iter
         if val_iter is not None and (epoch == hparams['nb_epochs'] - 1 or epoch % val_iter == 0):
             val_loader = DataLoader(val_dataset, batch_size=1)
 
-            loss_velo, loss_press = test(device, model, val_loader)
+            test_out = test(device, model, val_loader, coef_norm=coef_norm if coef_norm else None)
+            if len(test_out) == 4:
+                loss_press, loss_velo, l2_press, l2_velo = test_out
+                history['val_l2_press'].append(float(l2_press))
+                history['val_l2_velo'].append(float(l2_velo))
+            else:
+                loss_press, loss_velo = test_out
+                l2_press = l2_velo = None
             val_loss = loss_velo + reg * loss_press
             del (val_loader)
 
             history['val_epoch'].append(epoch + 1)
             history['val_loss'].append(float(val_loss))
-            pbar_train.set_postfix(train_loss=train_loss, val_loss=val_loss)
+            if l2_press is not None:
+                pbar_train.set_postfix(train_loss=train_loss, val_loss=val_loss,
+                                       l2_p=l2_press, l2_v=l2_velo)
+            else:
+                pbar_train.set_postfix(train_loss=train_loss, val_loss=val_loss)
         else:
             pbar_train.set_postfix(train_loss=train_loss)
 
@@ -163,7 +195,9 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, reg=1, val_iter
                     'hparams': hparams,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
-                    'coef_norm': list(coef_norm),
+                    'final_val_l2_press': history['val_l2_press'][-1] if history['val_l2_press'] else None,
+                    'final_val_l2_velo': history['val_l2_velo'][-1] if history['val_l2_velo'] else None,
+                    'coef_norm': coef_norm_to_jsonable(coef_norm),
                 }, f, indent=12, cls=NumpyEncoder
             )
 

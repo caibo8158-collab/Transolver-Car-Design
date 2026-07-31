@@ -149,9 +149,108 @@ def visualize_poly_data(poly_data, surface_filter, normal_filter=None):
     interactor.Start()
 
 
+# ========================= 归一化工具 =========================
+
+def _safe_std(std):
+    """避免常数通道（如表面 sdf=0、体积压力占位 0）除零。"""
+    std = np.asarray(std, dtype=np.float64).copy()
+    std[std < 1e-8] = 1.0
+    return std
+
+
+def _running_mean_update(mean, total_n, batch, batch_n):
+    """在线更新均值。"""
+    if batch_n == 0:
+        return mean, total_n
+    new_n = total_n + batch_n
+    if total_n == 0:
+        return batch.mean(axis=0), batch_n
+    mean = mean + (batch.sum(axis=0) - batch_n * mean) / new_n
+    return mean, new_n
+
+
+def _running_var_update(var, total_n, batch, mean, batch_n):
+    """在已知全局 mean 后，在线更新总体方差（第二遍扫描用）。"""
+    if batch_n == 0:
+        return var, total_n
+    new_n = total_n + batch_n
+    sq = ((batch - mean) ** 2).sum(axis=0)
+    if total_n == 0:
+        return sq / batch_n, batch_n
+    var = var + (sq - batch_n * var) / new_n
+    return var, new_n
+
+
+def is_separate_coef(coef_norm):
+    return isinstance(coef_norm, dict) and coef_norm.get('mode') == 'separate'
+
+
+def apply_coef_norm(x, y, surf, coef_norm):
+    """按 coef_norm 对单样本 x/y 做标准化，返回 float tensor。"""
+    surf_np = surf.numpy().astype(bool) if torch.is_tensor(surf) else np.asarray(surf).astype(bool)
+    x_np = x.numpy() if torch.is_tensor(x) else np.asarray(x)
+    y_np = y.numpy() if torch.is_tensor(y) else np.asarray(y)
+
+    if is_separate_coef(coef_norm):
+        mi_s, si_s, mo_s, so_s = coef_norm['surf']
+        mi_v, si_v, mo_v, so_v = coef_norm['vol']
+        x_out = x_np.copy()
+        y_out = y_np.copy()
+        if surf_np.any():
+            x_out[surf_np] = (x_np[surf_np] - mi_s) / (si_s + 1e-8)
+            y_out[surf_np] = (y_np[surf_np] - mo_s) / (so_s + 1e-8)
+        if (~surf_np).any():
+            x_out[~surf_np] = (x_np[~surf_np] - mi_v) / (si_v + 1e-8)
+            y_out[~surf_np] = (y_np[~surf_np] - mo_v) / (so_v + 1e-8)
+        return torch.tensor(x_out).float(), torch.tensor(y_out).float()
+
+    mean_in, std_in, mean_out, std_out = coef_norm
+    x_out = (x_np - mean_in) / (std_in + 1e-8)
+    y_out = (y_np - mean_out) / (std_out + 1e-8)
+    return torch.tensor(x_out).float(), torch.tensor(y_out).float()
+
+
+def denormalize_y(y, surf, coef_norm):
+    """
+    将标准化后的 y（或预测）还原到物理量纲。
+    y: [N, 4] tensor；surf: bool mask
+    """
+    if coef_norm is None:
+        return y
+    if is_separate_coef(coef_norm):
+        out = y.clone()
+        _, _, mo_s, so_s = coef_norm['surf']
+        _, _, mo_v, so_v = coef_norm['vol']
+        mo_s = torch.as_tensor(mo_s, device=y.device, dtype=y.dtype)
+        so_s = torch.as_tensor(so_s, device=y.device, dtype=y.dtype)
+        mo_v = torch.as_tensor(mo_v, device=y.device, dtype=y.dtype)
+        so_v = torch.as_tensor(so_v, device=y.device, dtype=y.dtype)
+        out[surf] = y[surf] * so_s + mo_s
+        out[~surf] = y[~surf] * so_v + mo_v
+        return out
+
+    mean_out = torch.as_tensor(coef_norm[2], device=y.device, dtype=y.dtype)
+    std_out = torch.as_tensor(coef_norm[3], device=y.device, dtype=y.dtype)
+    return y * std_out + mean_out
+
+
+def coef_norm_to_jsonable(coef_norm):
+    """供日志序列化。"""
+    if coef_norm is None:
+        return None
+    if is_separate_coef(coef_norm):
+        return {
+            'mode': 'separate',
+            'surf': [np.asarray(a).tolist() for a in coef_norm['surf']],
+            'vol': [np.asarray(a).tolist() for a in coef_norm['vol']],
+        }
+    return [np.asarray(a).tolist() for a in coef_norm]
+
+
 # ========================= 数据预处理主函数 =========================
 
-def get_datalist(root, samples, norm=False, coef_norm=None, savedir=None, preprocessed=False):
+def get_datalist(root, samples, norm=False, coef_norm=None, savedir=None, preprocessed=False,
+                 norm_mode='global'):
     """
     将样本列表转为 PyG Data 列表（可选标准化，并缓存到 savedir）。
 
@@ -159,18 +258,21 @@ def get_datalist(root, samples, norm=False, coef_norm=None, savedir=None, prepro
         root: 原始数据根目录（含 param*/样本/vtk）
         samples: 样本相对路径列表，如 ['param0/xxx', ...]
         norm: 是否标准化
-        coef_norm: 已有归一化系数 (mean_in, std_in, mean_out, std_out)；验证集传入训练集系数
+        coef_norm: 已有归一化系数；验证集传入训练集系数
         savedir: 预处理缓存目录
         preprocessed: True 则直接读 npy；False 则从 VTK 现场处理
+        norm_mode: 'global' 全体点统一 mean/std；
+                   'separate' 表面点 / 体积点各自统计并归一化
 
     每个点特征:
         x (init): [x,y,z, sdf, nx,ny,nz] 共 7 维
         y (target): [vx,vy,vz, p] 共 4 维
         surf: 是否为表面点
     """
+    if norm_mode not in ('global', 'separate'):
+        raise ValueError(f'未知 norm_mode: {norm_mode!r}，可选 global / separate')
+
     dataset = []
-    mean_in, mean_out = 0, 0
-    std_in, std_out = 0, 0
     for k, s in enumerate(samples):
         # ----- 已预处理：直接读 npy -----
         if preprocessed and savedir is not None:
@@ -251,58 +353,93 @@ def get_datalist(root, samples, norm=False, coef_norm=None, savedir=None, prepro
                 np.save(os.path.join(save_path, 'surf.npy'), surf)
                 np.save(os.path.join(save_path, 'edge_index.npy'), edge_index)
 
-        # 转为 tensor，封装为 PyG Data
+        # 转为 tensor，封装为 PyG Data（标准化在全部样本读完后统一做）
         surf = torch.tensor(surf)
         pos = torch.tensor(pos)
         x = torch.tensor(init)
         y = torch.tensor(target)
         edge_index = torch.tensor(edge_index)
-
-        # 训练集：在线累积输入/输出均值（后续再算 std）
-        if norm and coef_norm is None:
-            if k == 0:
-                old_length = init.shape[0]
-                mean_in = init.mean(axis=0)
-                mean_out = target.mean(axis=0)
-            else:
-                new_length = old_length + init.shape[0]
-                mean_in += (init.sum(axis=0) - init.shape[0] * mean_in) / new_length
-                mean_out += (target.sum(axis=0) - init.shape[0] * mean_out) / new_length
-                old_length = new_length
         data = Data(pos=pos, x=x, y=y, surf=surf.bool(), edge_index=edge_index)
-        # data = Data(pos=pos, x=x, y=y, surf=surf.bool())
         dataset.append(data)
 
-    # 训练集：算标准差并标准化，返回 (dataset, coef_norm)
+    # 训练集：算均值/标准差并标准化，返回 (dataset, coef_norm)
     if norm and coef_norm is None:
-        for k, data in enumerate(dataset):
-            if k == 0:
-                old_length = data.x.numpy().shape[0]
-                std_in = ((data.x.numpy() - mean_in) ** 2).sum(axis=0) / old_length
-                std_out = ((data.y.numpy() - mean_out) ** 2).sum(axis=0) / old_length
-            else:
-                new_length = old_length + data.x.numpy().shape[0]
-                std_in += (((data.x.numpy() - mean_in) ** 2).sum(axis=0) - data.x.numpy().shape[
-                    0] * std_in) / new_length
-                std_out += (((data.y.numpy() - mean_out) ** 2).sum(axis=0) - data.x.numpy().shape[
-                    0] * std_out) / new_length
-                old_length = new_length
+        if norm_mode == 'global':
+            n_all = 0
+            mean_in = mean_out = 0
+            for data in dataset:
+                x_np, y_np = data.x.numpy(), data.y.numpy()
+                n = x_np.shape[0]
+                mean_in, n_new = _running_mean_update(mean_in, n_all, x_np, n)
+                mean_out, _ = _running_mean_update(mean_out, n_all, y_np, n)
+                n_all = n_new
 
-        std_in = np.sqrt(std_in)
-        std_out = np.sqrt(std_out)
+            n_tmp = 0
+            var_in = var_out = 0
+            for data in dataset:
+                x_np, y_np = data.x.numpy(), data.y.numpy()
+                n = x_np.shape[0]
+                var_in, n_new = _running_var_update(var_in, n_tmp, x_np, mean_in, n)
+                var_out, _ = _running_var_update(var_out, n_tmp, y_np, mean_out, n)
+                n_tmp = n_new
+            std_in = _safe_std(np.sqrt(var_in))
+            std_out = _safe_std(np.sqrt(var_out))
+            coef_norm = (mean_in, std_in, mean_out, std_out)
+            print('norm_mode=global | n_all=', n_all)
+            print('  out mean/std:', mean_out, std_out)
+        else:
+            n_surf = n_vol = 0
+            mean_in_s = mean_out_s = mean_in_v = mean_out_v = 0
+            for data in dataset:
+                x_np, y_np = data.x.numpy(), data.y.numpy()
+                surf_np = data.surf.numpy().astype(bool)
+                if surf_np.any():
+                    ns = int(surf_np.sum())
+                    mean_in_s, n_s_new = _running_mean_update(mean_in_s, n_surf, x_np[surf_np], ns)
+                    mean_out_s, _ = _running_mean_update(mean_out_s, n_surf, y_np[surf_np], ns)
+                    n_surf = n_s_new
+                if (~surf_np).any():
+                    nv = int((~surf_np).sum())
+                    mean_in_v, n_v_new = _running_mean_update(mean_in_v, n_vol, x_np[~surf_np], nv)
+                    mean_out_v, _ = _running_mean_update(mean_out_v, n_vol, y_np[~surf_np], nv)
+                    n_vol = n_v_new
+
+            n_s_tmp = n_v_tmp = 0
+            var_in_s = var_out_s = var_in_v = var_out_v = 0
+            for data in dataset:
+                x_np, y_np = data.x.numpy(), data.y.numpy()
+                surf_np = data.surf.numpy().astype(bool)
+                if surf_np.any():
+                    ns = int(surf_np.sum())
+                    var_in_s, n_s_new = _running_var_update(var_in_s, n_s_tmp, x_np[surf_np], mean_in_s, ns)
+                    var_out_s, _ = _running_var_update(var_out_s, n_s_tmp, y_np[surf_np], mean_out_s, ns)
+                    n_s_tmp = n_s_new
+                if (~surf_np).any():
+                    nv = int((~surf_np).sum())
+                    var_in_v, n_v_new = _running_var_update(var_in_v, n_v_tmp, x_np[~surf_np], mean_in_v, nv)
+                    var_out_v, _ = _running_var_update(var_out_v, n_v_tmp, y_np[~surf_np], mean_out_v, nv)
+                    n_v_tmp = n_v_new
+
+            coef_norm = {
+                'mode': 'separate',
+                'surf': (mean_in_s, _safe_std(np.sqrt(var_in_s)),
+                         mean_out_s, _safe_std(np.sqrt(var_out_s))),
+                'vol': (mean_in_v, _safe_std(np.sqrt(var_in_v)),
+                        mean_out_v, _safe_std(np.sqrt(var_out_v))),
+            }
+            print('norm_mode=separate | n_surf=', n_surf, 'n_vol=', n_vol)
+            print('  surf out mean/std:', coef_norm['surf'][2], coef_norm['surf'][3])
+            print('  vol  out mean/std:', coef_norm['vol'][2], coef_norm['vol'][3])
 
         for data in dataset:
-            data.x = ((data.x - mean_in) / (std_in + 1e-8)).float()
-            data.y = ((data.y - mean_out) / (std_out + 1e-8)).float()
+            data.x, data.y = apply_coef_norm(data.x, data.y, data.surf, coef_norm)
 
-        coef_norm = (mean_in, std_in, mean_out, std_out)
         dataset = (dataset, coef_norm)
 
     # 验证集：使用训练集的 coef_norm 做同样标准化
     elif coef_norm is not None:
         for data in dataset:
-            data.x = ((data.x - coef_norm[0]) / (coef_norm[1] + 1e-8)).float()
-            data.y = ((data.y - coef_norm[2]) / (coef_norm[3] + 1e-8)).float()
+            data.x, data.y = apply_coef_norm(data.x, data.y, data.surf, coef_norm)
 
     return dataset
 
